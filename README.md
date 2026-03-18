@@ -129,17 +129,20 @@ chess-app/
 - **Node.js** v18 or higher
 - **npm** v8 or higher
 
+### Play on : https://chess-weld-nine.vercel.app/
+
+#### For Local :
 ### 1 · Clone & install
 
 ```bash
-git clone https://github.com/your-username/chess-app.git
-cd chess-app
+git clone https://github.com/your-username/chess.git
+cd chess
 ```
 
 ### 2 · Start the backend
 
 ```bash
-cd chess-backend
+cd backend
 npm install
 npm start
 # Server running on http://localhost:8080
@@ -154,7 +157,7 @@ npx nodemon server.js
 ### 3 · Start the frontend
 
 ```bash
-cd chess-frontend
+cd frontend
 npm install
 npm start
 # App running on http://localhost:3000
