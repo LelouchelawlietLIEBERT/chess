@@ -170,7 +170,7 @@ export default function App() {
   const [selectedSq,       setSelectedSq]       = useState(null);
   const [optionSquares,    setOptionSquares]    = useState({});
 
-  // Promotion picker: { from, to } when awaiting piece choice
+  // Promotion picker: { from, to, isPremove? } when awaiting piece choice
   const [pendingPromo,     setPendingPromo]     = useState(null);
 
   // Premove state
@@ -343,11 +343,15 @@ export default function App() {
       if (!piece || piece.color !== myColor) {
         setPremoveSq(null); setPremove(null); return;
       }
-      const promotion = piece.type === "p" &&
-        ((myColor === "w" && square[1] === "8") || (myColor === "b" && square[1] === "1"))
-        ? "q" : undefined;
-      setPremove({ from: premoveSq, to: square, promotion });
-      setPremoveSq(null);
+      const isPromo = piece.type === "p" &&
+        ((myColor === "w" && square[1] === "8") || (myColor === "b" && square[1] === "1"));
+      if (isPromo) {
+        setPendingPromo({ from: premoveSq, to: square, isPremove: true });
+        setPremoveSq(null);
+      } else {
+        setPremove({ from: premoveSq, to: square });
+        setPremoveSq(null);
+      }
     } else {
       // First click — must be our own piece
       const piece = chess.get(square);
@@ -381,7 +385,11 @@ export default function App() {
       if (!p || p.color !== myColor) return false;
       const isPromo = piece[1] === "P" &&
         ((myColor === "w" && to[1] === "8") || (myColor === "b" && to[1] === "1"));
-      setPremove({ from, to, promotion: isPromo ? "q" : undefined });
+      if (isPromo) {
+        setPendingPromo({ from, to, isPremove: true });
+      } else {
+        setPremove({ from, to });
+      }
       setPremoveSq(null);
       return false;
     }
@@ -393,7 +401,13 @@ export default function App() {
   // ─── Confirm promotion piece ─────────────────────────────────────────────────
   const confirmPromotion = (piece) => {
     if (!pendingPromo) return;
-    socketRef.current?.emit("makeMove", { roomId, move: { ...pendingPromo, promotion: piece } });
+    if (pendingPromo.isPremove) {
+      // Queue as premove with chosen piece
+      setPremove({ from: pendingPromo.from, to: pendingPromo.to, promotion: piece });
+    } else {
+      // Fire immediately
+      socketRef.current?.emit("makeMove", { roomId, move: { from: pendingPromo.from, to: pendingPromo.to, promotion: piece } });
+    }
     setPendingPromo(null);
   };
   const cancelPromotion = () => setPendingPromo(null);
@@ -623,7 +637,7 @@ export default function App() {
               alignItems:"center", gap:18,
             }} onClick={e => e.stopPropagation()}>
               <p style={{ fontSize:13, letterSpacing:3, textTransform:"uppercase", color:"#6b5f4b" }}>
-                Promote to
+                {pendingPromo?.isPremove ? "Premove — promote to" : "Promote to"}
               </p>
               <div style={{ display:"flex", gap:12 }}>
                 {[
