@@ -335,42 +335,7 @@ Set `REACT_APP_SOCKET_URL` before building for production:
 ```bash
 REACT_APP_SOCKET_URL=https://your-backend.railway.app npm run build
 ```
-
 ---
-
-## Deployment Guide
-
-### Backend → Railway
-
-1. Push the repo to GitHub
-2. Go to [railway.app](https://railway.app) → **New Project → Deploy from GitHub**
-3. Set **Root Directory** to `chess-backend`
-4. Railway auto-detects Node.js and runs `npm start`
-5. Go to **Settings → Networking → Generate Domain** to get your public URL
-
-> Do **not** set a `PORT` variable — Railway injects it automatically.
-
-### Frontend → Vercel
-
-1. Go to [vercel.com](https://vercel.com) → **New Project → Import** your repo
-2. Set **Root Directory** to `chess-frontend`
-3. Add environment variable:
-
-   | Key | Value |
-   |---|---|
-   | `REACT_APP_SOCKET_URL` | `https://your-backend.up.railway.app` |
-
-4. Deploy — Vercel runs `npm run build` automatically
-
-### Cost
-
-| Platform | Service | Free Tier |
-|---|---|---|
-| Railway | Node.js backend + Socket.io | 500 hrs / month |
-| Vercel | React frontend (static) | Unlimited |
-
----
-
 ## Roadmap
 
 | Feature | Status |
