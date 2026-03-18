@@ -167,8 +167,11 @@ export default function App() {
   const [chatMessages, setChatMessages] = useState([]);
 
   // Click-to-move
-  const [selectedSq,    setSelectedSq]    = useState(null);
-  const [optionSquares, setOptionSquares] = useState({});
+  const [selectedSq,       setSelectedSq]       = useState(null);
+  const [optionSquares,    setOptionSquares]    = useState({});
+
+  // Promotion picker: { from, to } when awaiting piece choice
+  const [pendingPromo,     setPendingPromo]     = useState(null);
 
   // Premove state
   const [premove,       setPremove]       = useState(null);   // { from, to, promotion? }
@@ -311,11 +314,15 @@ export default function App() {
         const moves = chess.moves({ square: selectedSq, verbose: true });
         const target = moves.find(m => m.to === square);
         if (target) {
-          const promotion = target.piece === "p" &&
-            ((myColor === "w" && square[1] === "8") || (myColor === "b" && square[1] === "1"))
-            ? "q" : undefined;
-          socketRef.current?.emit("makeMove", { roomId, move: { from: selectedSq, to: square, promotion } });
-          setSelectedSq(null); setOptionSquares({});
+          const isPromo = target.piece === "p" &&
+            ((myColor === "w" && square[1] === "8") || (myColor === "b" && square[1] === "1"));
+          if (isPromo) {
+            setPendingPromo({ from: selectedSq, to: square });
+            setSelectedSq(null); setOptionSquares({});
+          } else {
+            socketRef.current?.emit("makeMove", { roomId, move: { from: selectedSq, to: square } });
+            setSelectedSq(null); setOptionSquares({});
+          }
           return;
         }
       }
@@ -356,28 +363,40 @@ export default function App() {
     const chess = chessRef.current;
     const isMyTurnNow = turn === myColor;
 
-    const promotion = piece[1] === "P" &&
-      ((myColor === "w" && to[1] === "8") || (myColor === "b" && to[1] === "1"))
-      ? "q" : undefined;
-
     if (isMyTurnNow) {
       // Validate locally before sending
       const legal = chess.moves({ verbose: true }).some(m => m.from === from && m.to === to);
       if (!legal) return false;
-      socketRef.current?.emit("makeMove", { roomId, move: { from, to, promotion } });
+      const isPromo = piece[1] === "P" &&
+        ((myColor === "w" && to[1] === "8") || (myColor === "b" && to[1] === "1"));
+      if (isPromo) {
+        setPendingPromo({ from, to });
+        return false; // hold board until piece chosen
+      }
+      socketRef.current?.emit("makeMove", { roomId, move: { from, to } });
       return true;
     } else {
-      // Drag premove — any of our pieces to anywhere
+      // Drag premove — any of our pieces to anywhere (premove always promotes to queen)
       const p = chess.get(from);
       if (!p || p.color !== myColor) return false;
-      setPremove({ from, to, promotion });
+      const isPromo = piece[1] === "P" &&
+        ((myColor === "w" && to[1] === "8") || (myColor === "b" && to[1] === "1"));
+      setPremove({ from, to, promotion: isPromo ? "q" : undefined });
       setPremoveSq(null);
-      return false; // Don't visually move the piece
+      return false;
     }
   }, [turn, myColor, roomId]);
 
   // ─── Cancel premove ──────────────────────────────────────────────────────────
   const cancelPremove = () => { setPremove(null); setPremoveSq(null); };
+
+  // ─── Confirm promotion piece ─────────────────────────────────────────────────
+  const confirmPromotion = (piece) => {
+    if (!pendingPromo) return;
+    socketRef.current?.emit("makeMove", { roomId, move: { ...pendingPromo, promotion: piece } });
+    setPendingPromo(null);
+  };
+  const cancelPromotion = () => setPendingPromo(null);
 
   // ─── Chat ────────────────────────────────────────────────────────────────────
   const sendChat = useCallback((text) => {
@@ -587,6 +606,50 @@ export default function App() {
               minWidth:0, alignSelf:"stretch", minHeight:0 }}>
               <MoveHistory history={history} />
               <Chat messages={chatMessages} onSend={sendChat} myName={myName} />
+            </div>
+          </div>
+        )}
+
+        {/* ── PROMOTION PICKER ────────────────────────────────────────────────── */}
+        {pendingPromo && (
+          <div style={{
+            position:"fixed", inset:0, background:"rgba(0,0,0,0.72)",
+            display:"flex", alignItems:"center", justifyContent:"center",
+            zIndex:200, backdropFilter:"blur(6px)",
+          }} onClick={cancelPromotion}>
+            <div style={{
+              background:"#1a1714", border:"1px solid #3a3228", borderRadius:12,
+              padding:"32px 28px", display:"flex", flexDirection:"column",
+              alignItems:"center", gap:18,
+            }} onClick={e => e.stopPropagation()}>
+              <p style={{ fontSize:13, letterSpacing:3, textTransform:"uppercase", color:"#6b5f4b" }}>
+                Promote to
+              </p>
+              <div style={{ display:"flex", gap:12 }}>
+                {[
+                  { piece:"q", label:"Queen",  sym: myColor==="w" ? "♕" : "♛" },
+                  { piece:"r", label:"Rook",   sym: myColor==="w" ? "♖" : "♜" },
+                  { piece:"b", label:"Bishop", sym: myColor==="w" ? "♗" : "♝" },
+                  { piece:"n", label:"Knight", sym: myColor==="w" ? "♘" : "♞" },
+                ].map(({ piece, label, sym }) => (
+                  <button key={piece} onClick={() => confirmPromotion(piece)} style={{
+                    display:"flex", flexDirection:"column", alignItems:"center", gap:6,
+                    background:"#201d1a", border:"1px solid #3a3228", borderRadius:10,
+                    padding:"16px 20px", cursor:"pointer", transition:"all 0.15s",
+                    color:"#e8e0d0", fontFamily:"inherit",
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.borderColor="#c8a96e"; e.currentTarget.style.background="rgba(200,169,110,0.1)"; }}
+                  onMouseLeave={e => { e.currentTarget.style.borderColor="#3a3228"; e.currentTarget.style.background="#201d1a"; }}>
+                    <span style={{ fontSize:44, lineHeight:1 }}>{sym}</span>
+                    <span style={{ fontSize:10, letterSpacing:2, textTransform:"uppercase", color:"#6b5f4b" }}>{label}</span>
+                  </button>
+                ))}
+              </div>
+              <button onClick={cancelPromotion} style={{
+                background:"transparent", border:"none", color:"#4a4035",
+                fontSize:11, letterSpacing:2, textTransform:"uppercase",
+                cursor:"pointer", fontFamily:"inherit", marginTop:-4,
+              }}>cancel</button>
             </div>
           </div>
         )}
