@@ -146,8 +146,9 @@ function Chat({ messages, onSend, myName }) {
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  const socketRef = useRef(null);
-  const chessRef  = useRef(new Chess());
+  const socketRef     = useRef(null);
+  const chessRef      = useRef(new Chess());
+  const rollbackFenRef = useRef(null);   // snapshot before optimistic update, for rejection rollback
 
   const [phase,        setPhase]        = useState("lobby");
   const [selectedTC,   setSelectedTC]   = useState(5);
@@ -156,6 +157,7 @@ export default function App() {
   const [myName,       setMyName]       = useState("");
   const [opponentName, setOpponentName] = useState("");
   const [fen,          setFen]          = useState("start");
+  const [shake,        setShake]        = useState(false);  // board shake on rejection
   const [turn,         setTurn]         = useState("w");
   const [clocks,       setClocks]       = useState({ w: 300000, b: 300000 });
   // *** history stored independently — never derived from chess.history() after .load() ***
@@ -210,10 +212,12 @@ export default function App() {
 
     socket.on("moveUpdate", (data) => {
       // data: { fen, turn, move, clocks, san, history }
+      // Always reconcile with authoritative server FEN
       chessRef.current.load(data.fen);
       setFen(data.fen);
       setTurn(data.turn);
       setClocks(data.clocks);
+      rollbackFenRef.current = null; // server confirmed — clear rollback snapshot
 
       // *** Use server-sent history array if present, else append san locally ***
       if (Array.isArray(data.history)) {
@@ -234,10 +238,19 @@ export default function App() {
 
     socket.on("moveRejected", ({ reason }) => {
       setStatus(`⚠ ${reason}`);
+      // Roll back optimistic update
+      if (rollbackFenRef.current) {
+        chessRef.current.load(rollbackFenRef.current);
+        setFen(rollbackFenRef.current);
+        rollbackFenRef.current = null;
+      }
       setPremove(null);
       setPremoveSq(null);
       setSelectedSq(null);
       setOptionSquares({});
+      // Shake the board
+      setShake(true);
+      setTimeout(() => setShake(false), 500);
     });
 
     socket.on("gameOver", ({ reason, winner, winnerName, clocks }) => {
@@ -302,6 +315,31 @@ export default function App() {
     return styles;
   }, []);
 
+  // ─── Optimistic move helper ─────────────────────────────────────────────────
+  const sendMove = useCallback((move) => {
+    const chess = chessRef.current;
+    // Save current FEN for rollback
+    rollbackFenRef.current = chess.fen();
+    // Apply locally (chess.js clone so we don't mutate the ref yet)
+    const preview = new Chess(chess.fen());
+    let result;
+    try { result = preview.move(move); } catch { result = null; }
+    if (!result) {
+      rollbackFenRef.current = null;
+      return;
+    }
+    // Optimistically update board + history
+    chessRef.current.load(preview.fen());
+    setFen(preview.fen());
+    setTurn(preview.turn());
+    setLastMove({ from: result.from, to: result.to });
+    setHistory(preview.history());
+    setSelectedSq(null);
+    setOptionSquares({});
+    // Send to server for authoritative validation
+    socketRef.current?.emit("makeMove", { roomId, move });
+  }, [roomId]);
+
   // ─── Square click handler ────────────────────────────────────────────────────
   const onSquareClick = useCallback((square) => {
     if (phase !== "game") return;
@@ -320,8 +358,7 @@ export default function App() {
             setPendingPromo({ from: selectedSq, to: square });
             setSelectedSq(null); setOptionSquares({});
           } else {
-            socketRef.current?.emit("makeMove", { roomId, move: { from: selectedSq, to: square } });
-            setSelectedSq(null); setOptionSquares({});
+            sendMove({ from: selectedSq, to: square });
           }
           return;
         }
@@ -360,7 +397,7 @@ export default function App() {
         setPremove(null);
       }
     }
-  }, [phase, turn, myColor, selectedSq, premoveSq, roomId, getMoveOptions]);
+  }, [phase, turn, myColor, selectedSq, premoveSq, roomId, getMoveOptions, sendMove]);
 
   // ─── Drag-and-drop ──────────────────────────────────────────────────────────
   const onPieceDrop = useCallback((from, to, piece) => {
@@ -377,7 +414,7 @@ export default function App() {
         setPendingPromo({ from, to });
         return false; // hold board until piece chosen
       }
-      socketRef.current?.emit("makeMove", { roomId, move: { from, to } });
+      sendMove({ from, to });
       return true;
     } else {
       // Drag premove — any of our pieces to anywhere (premove always promotes to queen)
@@ -393,7 +430,7 @@ export default function App() {
       setPremoveSq(null);
       return false;
     }
-  }, [turn, myColor, roomId]);
+  }, [turn, myColor, roomId, sendMove]);
 
   // ─── Cancel premove ──────────────────────────────────────────────────────────
   const cancelPremove = () => { setPremove(null); setPremoveSq(null); };
@@ -405,8 +442,8 @@ export default function App() {
       // Queue as premove with chosen piece
       setPremove({ from: pendingPromo.from, to: pendingPromo.to, promotion: piece });
     } else {
-      // Fire immediately
-      socketRef.current?.emit("makeMove", { roomId, move: { from: pendingPromo.from, to: pendingPromo.to, promotion: piece } });
+      // Fire immediately with optimistic update
+      sendMove({ from: pendingPromo.from, to: pendingPromo.to, promotion: piece });
     }
     setPendingPromo(null);
   };
@@ -477,6 +514,14 @@ export default function App() {
         @keyframes checkGlow {
           0%,100% { box-shadow: 0 0 0 2px rgba(220,50,50,0.4), 0 20px 60px rgba(0,0,0,0.8); }
           50%     { box-shadow: 0 0 20px 4px rgba(220,50,50,0.7), 0 20px 60px rgba(0,0,0,0.8); }
+        }
+        @keyframes rejectShake {
+          0%,100% { transform: translateX(0); }
+          15%     { transform: translateX(-8px); }
+          30%     { transform: translateX(7px); }
+          45%     { transform: translateX(-5px); }
+          60%     { transform: translateX(4px); }
+          75%     { transform: translateX(-2px); }
         }
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -559,7 +604,8 @@ export default function App() {
                 boxShadow: inCheck && turn===myColor
                   ? "0 0 0 3px rgba(220,50,50,0.7), 0 20px 60px rgba(0,0,0,0.8)"
                   : "0 20px 60px rgba(0,0,0,0.8), 0 0 0 1px #2e2820",
-                animation: inCheck && turn===myColor ? "checkGlow 1.5s ease-in-out infinite" : "none",
+                animation: shake ? "rejectShake 0.45s ease"
+                  : inCheck && turn===myColor ? "checkGlow 1.5s ease-in-out infinite" : "none",
               }}>
                 <Chessboard
                   position={fen}
