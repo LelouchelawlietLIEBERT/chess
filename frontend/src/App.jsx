@@ -159,7 +159,14 @@ export default function App() {
   const [fen,          setFen]          = useState("start");
   const [shake,        setShake]        = useState(false);  // board shake on rejection
   const [turn,         setTurn]         = useState("w");
-  const [clocks,       setClocks]       = useState({ w: 300000, b: 300000 });
+
+  // *** displayClocks is what the UI renders — ticks down locally every 100ms.
+  //     clockSyncRef holds the last authoritative server snapshot + the wall-clock
+  //     time it was received, so we can compute "elapsed since sync" independent
+  //     of the render cycle instead of only updating when a socket event fires. ***
+  const [displayClocks, setDisplayClocks] = useState({ w: 300000, b: 300000 });
+  const clockSyncRef = useRef({ clocks: { w: 300000, b: 300000 }, turn: "w", ts: Date.now(), running: false });
+
   // *** history stored independently — never derived from chess.history() after .load() ***
   const [history,      setHistory]      = useState([]);
   const [lastMove,     setLastMove]     = useState(null);
@@ -179,6 +186,33 @@ export default function App() {
   const [premove,       setPremove]       = useState(null);   // { from, to, promotion? }
   const [premoveSq,     setPremoveSq]     = useState(null);   // first square of pending premove click
 
+  // ─── Clock sync helper ───────────────────────────────────────────────────────
+  // Call this any time we get an authoritative clocks+turn snapshot from the server
+  // (gameStart, moveUpdate, clockUpdate, gameOver). It resets the "elapsed since
+  // sync" baseline so local ticking stays accurate instead of drifting or freezing.
+  const syncClocks = useCallback((clocks, turnColor, running) => {
+    clockSyncRef.current = { clocks: { ...clocks }, turn: turnColor, ts: Date.now(), running };
+    setDisplayClocks({ ...clocks });
+  }, []);
+
+  // Local ticking loop — runs continuously while a game is in progress, decrementing
+  // only the side whose turn it is, and resyncing against the server snapshot on
+  // every tick so client-side ticking can never drift far from server truth.
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const sync = clockSyncRef.current;
+      if (!sync.running) return;
+      const elapsed = Date.now() - sync.ts;
+      const active = sync.turn;
+      setDisplayClocks(prev => {
+        const next = { ...sync.clocks };
+        next[active] = Math.max(0, sync.clocks[active] - elapsed);
+        return next;
+      });
+    }, 100);
+    return () => clearInterval(interval);
+  }, []);
+
   // ─── Socket ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     const socket = io(SOCKET_URL, { transports: ["websocket"] });
@@ -196,7 +230,7 @@ export default function App() {
       if (data.myName) setMyName(data.myName);
       setFen(data.fen);
       setTurn(data.turn || "w");
-      setClocks(data.clocks);
+      syncClocks(data.clocks, data.turn || "w", true);
       setHistory([]);
       setLastMove(null);
       setGameOver(null);
@@ -216,7 +250,7 @@ export default function App() {
       chessRef.current.load(data.fen);
       setFen(data.fen);
       setTurn(data.turn);
-      setClocks(data.clocks);
+      syncClocks(data.clocks, data.turn, true);
       rollbackFenRef.current = null; // server confirmed — clear rollback snapshot
 
       // *** Use server-sent history array if present, else append san locally ***
@@ -234,7 +268,7 @@ export default function App() {
       // We use a ref trick: read premove from a ref so the closure is fresh
     });
 
-    socket.on("clockUpdate", ({ clocks }) => setClocks({ ...clocks }));
+    socket.on("clockUpdate", ({ clocks }) => syncClocks(clocks, clockSyncRef.current.turn, true));
 
     socket.on("moveRejected", ({ reason }) => {
       setStatus(`⚠ ${reason}`);
@@ -254,7 +288,8 @@ export default function App() {
     });
 
     socket.on("gameOver", ({ reason, winner, winnerName, clocks }) => {
-      if (clocks) setClocks(clocks);
+      if (clocks) syncClocks(clocks, clockSyncRef.current.turn, false);
+      else clockSyncRef.current.running = false;
       setGameOver({ reason, winner, winnerName });
       setPremove(null);
       setPremoveSq(null);
@@ -269,7 +304,7 @@ export default function App() {
     socket.on("drawDeclined", () => setStatus("Draw declined."));
 
     return () => socket.disconnect();
-  }, []);
+  }, [syncClocks]);
 
   // ─── Premove fire effect ─────────────────────────────────────────────────────
   // When turn changes to myColor and there's a queued premove, fire it
@@ -332,6 +367,9 @@ export default function App() {
     chessRef.current.load(preview.fen());
     setFen(preview.fen());
     setTurn(preview.turn());
+    // Optimistically flip whose clock is ticking too, so the UI reflects the
+    // move immediately instead of waiting for the server's moveUpdate/clockUpdate.
+    clockSyncRef.current = { ...clockSyncRef.current, turn: preview.turn(), ts: Date.now() };
     setLastMove({ from: result.from, to: result.to });
     setHistory(preview.history());
     setSelectedSq(null);
@@ -462,7 +500,11 @@ export default function App() {
   const offerDraw  = () => { socketRef.current?.emit("offerDraw", { roomId }); setStatus("Draw offered…"); };
   const acceptDraw = () => { socketRef.current?.emit("acceptDraw", { roomId }); setDrawOffered(false); };
   const declineDraw= () => { socketRef.current?.emit("declineDraw", { roomId }); setDrawOffered(false); };
-  const playAgain  = () => { setPhase("lobby"); setGameOver(null); setFen("start"); chessRef.current = new Chess(); };
+  const playAgain  = () => {
+    setPhase("lobby"); setGameOver(null); setFen("start"); chessRef.current = new Chess();
+    clockSyncRef.current = { clocks: { w: 300000, b: 300000 }, turn: "w", ts: Date.now(), running: false };
+    setDisplayClocks({ w: 300000, b: 300000 });
+  };
 
   // ─── Square styles ───────────────────────────────────────────────────────────
   const chess   = chessRef.current;
@@ -470,8 +512,8 @@ export default function App() {
   const isMyTurn= phase === "game" && turn === myColor;
   const inCheck = phase === "game" && chess.inCheck();
   const kingPos = inCheck ? kingSquare(chess, turn) : null;
-  const myMs    = clocks[myColor] ?? 0;
-  const oppMs   = clocks[oppColor] ?? 0;
+  const myMs    = displayClocks[myColor] ?? 0;
+  const oppMs   = displayClocks[oppColor] ?? 0;
 
   const sqStyles = { ...optionSquares };
   if (lastMove) {
