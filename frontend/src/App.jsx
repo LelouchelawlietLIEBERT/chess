@@ -195,6 +195,22 @@ export default function App() {
     setDisplayClocks({ ...clocks });
   }, []);
 
+  // Called on an optimistic local move, BEFORE the server confirms it. Unlike
+  // syncClocks (which snaps to a fresh authoritative value), this bakes the time
+  // actually spent since the last sync into the mover's clock, then flips whose
+  // clock is running. Without this, flipping the active color while reusing the
+  // old (pre-move) snapshot leaves the mover's own clock frozen at a stale, too-high
+  // value until the server's moveUpdate arrives — which is the "extra 5-10s" bug.
+  const flipClockOnMove = useCallback((newTurn) => {
+    const sync = clockSyncRef.current;
+    const elapsed = Date.now() - sync.ts;
+    const movedColor = sync.turn;
+    const newClocks = { ...sync.clocks };
+    newClocks[movedColor] = Math.max(0, sync.clocks[movedColor] - elapsed);
+    clockSyncRef.current = { clocks: newClocks, turn: newTurn, ts: Date.now(), running: true };
+    setDisplayClocks({ ...newClocks });
+  }, []);
+
   // Local ticking loop — runs continuously while a game is in progress, decrementing
   // only the side whose turn it is, and resyncing against the server snapshot on
   // every tick so client-side ticking can never drift far from server truth.
@@ -369,14 +385,16 @@ export default function App() {
     setTurn(preview.turn());
     // Optimistically flip whose clock is ticking too, so the UI reflects the
     // move immediately instead of waiting for the server's moveUpdate/clockUpdate.
-    clockSyncRef.current = { ...clockSyncRef.current, turn: preview.turn(), ts: Date.now() };
+    // (This correctly bakes in the time spent on the move before flipping — see
+    // flipClockOnMove above.)
+    flipClockOnMove(preview.turn());
     setLastMove({ from: result.from, to: result.to });
     setHistory(preview.history());
     setSelectedSq(null);
     setOptionSquares({});
     // Send to server for authoritative validation
     socketRef.current?.emit("makeMove", { roomId, move });
-  }, [roomId]);
+  }, [roomId, flipClockOnMove]);
 
   // ─── Square click handler ────────────────────────────────────────────────────
   const onSquareClick = useCallback((square) => {
