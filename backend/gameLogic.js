@@ -1,23 +1,5 @@
 const { Chess } = require("chess.js");
 
-// ─── Adjective + Noun name generator ────────────────────────────────────────
-const ADJECTIVES = [
-  "Silent", "Fierce", "Ancient", "Cunning", "Reckless", "Stoic",
-  "Phantom", "Crimson", "Obsidian", "Golden", "Iron", "Swift",
-  "Ruthless", "Hollow", "Feral", "Marble", "Ashen", "Blazing",
-];
-const NOUNS = [
-  "Bishop", "Knight", "Rook", "Gambit", "Pawn", "Monarch",
-  "Tactician", "Sovereign", "Oracle", "Crusader", "Sentinel", "Shadow",
-  "Champion", "Warlord", "Arbiter", "Pilgrim", "Phantom", "Exile",
-];
-
-function generateName() {
-  const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
-  const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
-  return `${adj} ${noun}`;
-}
-
 // ─── In-memory state ─────────────────────────────────────────────────────────
 // queues[timeControl] = [socketId, ...]
 const queues = {};
@@ -30,14 +12,16 @@ const queues = {};
 //   blackName: string,
 //   timeControl: number (seconds),
 //   clocks: { w: ms, b: ms },
-//   lastMoveAt: Date | null,
 //   turnStart: Date,
 //   timerRef: NodeJS timer,
 //   status: 'active' | 'ended',
 // }
 const activeGames = {};
 
-// playerNames[socketId] = string
+// privateRooms[roomCode] = { socketId, timeControl, createdAt }
+const privateRooms = {};
+
+// playerNames[socketId] = string (authenticated username)
 const playerNames = {};
 
 // socketRoom[socketId] = roomId  (for quick lookup on disconnect)
@@ -48,14 +32,40 @@ function getRoomId() {
   return `room_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function getOrAssignName(socketId) {
-  if (!playerNames[socketId]) {
-    playerNames[socketId] = generateName();
-  }
-  return playerNames[socketId];
+function registerPlayer(socketId, username) {
+  playerNames[socketId] = username;
+  return username;
+}
+
+function getPlayerName(socketId) {
+  return playerNames[socketId] || "Player";
 }
 
 // ─── Matchmaking ─────────────────────────────────────────────────────────────
+function createGame(white, black, timeControl) {
+  const roomId = getRoomId();
+  const tcMs = Number(timeControl) * 60 * 1000;
+
+  const game = {
+    chess: new Chess(),
+    white,
+    black,
+    whiteName: getPlayerName(white),
+    blackName: getPlayerName(black),
+    timeControl: Number(timeControl),
+    clocks: { w: tcMs, b: tcMs },
+    turnStart: new Date(),
+    timerRef: null,
+    status: "active",
+  };
+
+  activeGames[roomId] = game;
+  socketRoom[white] = roomId;
+  socketRoom[black] = roomId;
+
+  return { matched: true, roomId, game, white, black };
+}
+
 /**
  * Attempt to match the joining socket with an existing waiter.
  * Returns { matched: false } or { matched: true, roomId, game }
@@ -80,28 +90,7 @@ function joinQueue(socketId, timeControl, io) {
         ? [socketId, opponentId]
         : [opponentId, socketId];
 
-    const roomId = getRoomId();
-    const tcMs = Number(tc) * 60 * 1000;
-
-    const game = {
-      chess: new Chess(),
-      white,
-      black,
-      whiteName: getOrAssignName(white),
-      blackName: getOrAssignName(black),
-      timeControl: Number(tc),
-      clocks: { w: tcMs, b: tcMs },
-      lastMoveAt: null,
-      turnStart: new Date(),
-      timerRef: null,
-      status: "active",
-    };
-
-    activeGames[roomId] = game;
-    socketRoom[white] = roomId;
-    socketRoom[black] = roomId;
-
-    return { matched: true, roomId, game, white, black };
+    return createGame(white, black, tc);
   } else {
     // No match — add to queue
     queues[tc].push(socketId);
@@ -114,6 +103,71 @@ function leaveQueue(socketId) {
     queues[tc] = queues[tc].filter((id) => id !== socketId);
   }
 }
+
+// ─── Private rooms ───────────────────────────────────────────────────────────
+function createPrivateRoom(socketId, timeControl) {
+  // A player can only host one private room at a time.
+  for (const [code, room] of Object.entries(privateRooms)) {
+    if (room.socketId === socketId) delete privateRooms[code];
+  }
+
+  let code;
+  do {
+    code = Math.random().toString(36).slice(2, 8).toUpperCase();
+  } while (code.length < 6 || privateRooms[code]);
+
+  privateRooms[code] = {
+    socketId,
+    timeControl: Number(timeControl),
+    createdAt: Date.now(),
+  };
+
+  return code;
+}
+
+/**
+ * Pair the joining socket with the private room's host.
+ * Returns { error } or { matched: true, roomId, game, white, black }.
+ */
+function joinPrivateRoom(socketId, code, io) {
+  const key = String(code || "").trim().toUpperCase();
+  const room = privateRooms[key];
+
+  if (!room) return { error: "Room not found" };
+  if (room.socketId === socketId) return { error: "Cannot join your own room" };
+
+  // Host may have disconnected while waiting.
+  if (!io.sockets.sockets.has(room.socketId)) {
+    delete privateRooms[key];
+    return { error: "Room no longer available" };
+  }
+
+  delete privateRooms[key];
+
+  const [white, black] =
+    Math.random() < 0.5
+      ? [room.socketId, socketId]
+      : [socketId, room.socketId];
+
+  return createGame(white, black, room.timeControl);
+}
+
+function cancelPrivateRoom(socketId, code) {
+  const key = String(code || "").trim().toUpperCase();
+  if (privateRooms[key]?.socketId === socketId) {
+    delete privateRooms[key];
+    return true;
+  }
+  return false;
+}
+
+// Expire private rooms that were never joined (10 minutes).
+setInterval(() => {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [code, room] of Object.entries(privateRooms)) {
+    if (room.createdAt < cutoff) delete privateRooms[code];
+  }
+}, 60 * 1000).unref();
 
 // ─── Clock management ────────────────────────────────────────────────────────
 function startClock(roomId, io) {
@@ -148,26 +202,31 @@ function startClock(roomId, io) {
         clocks: g.clocks,
       });
     } else {
-      // Broadcast live clock every second
+      // Broadcast live clock every second — clients interpolate between ticks.
       const clocks = {
         w: turn === "w" ? remaining : g.clocks.w,
         b: turn === "b" ? remaining : g.clocks.b,
       };
-      io.to(roomId).emit("clockUpdate", { clocks });
+      io.to(roomId).emit("clockUpdate", { clocks, turn });
     }
-  }, 250); // tick every 250 ms for smooth UI
+  }, 1000);
 }
 
-function stopClock(roomId) {
+function stopClock(roomId, color) {
   const game = activeGames[roomId];
   if (!game) return;
   clearInterval(game.timerRef);
-  // Deduct elapsed time from the clock of the player whose turn just ended
-  const turn = game.chess.turn();
+  game.timerRef = null;
+  // Deduct elapsed time from the clock of the player whose turn just ended.
+  // `color` is passed in by applyMove because chess.turn() has already flipped
+  // to the opponent by the time the move is applied.
+  const turn = color || game.chess.turn();
   if (game.turnStart) {
     const elapsed = Date.now() - game.turnStart.getTime();
     game.clocks[turn] = Math.max(0, game.clocks[turn] - elapsed);
   }
+  // The opponent's clock starts now.
+  game.turnStart = new Date();
 }
 
 // ─── Move validation ─────────────────────────────────────────────────────────
@@ -198,8 +257,9 @@ function applyMove(roomId, socketId, movePayload) {
 
   if (!move) return { ok: false, reason: "Illegal move" };
 
-  // Update clocks
-  stopClock(roomId);
+  // Deduct the mover's elapsed time first, then broadcast the updated clocks.
+  // move.color is the side that just moved (game.chess.turn() is now the opponent).
+  stopClock(roomId, move.color);
 
   const result = {
     ok: true,
@@ -245,6 +305,10 @@ function handleDisconnect(socketId, io) {
   leaveQueue(socketId);
   delete playerNames[socketId];
 
+  for (const [code, room] of Object.entries(privateRooms)) {
+    if (room.socketId === socketId) delete privateRooms[code];
+  }
+
   const roomId = socketRoom[socketId];
   if (!roomId) return;
 
@@ -279,7 +343,13 @@ module.exports = {
   startClock,
   stopClock,
   handleDisconnect,
-  getOrAssignName,
+  registerPlayer,
+  getPlayerName,
+  createGame,
+  createPrivateRoom,
+  joinPrivateRoom,
+  cancelPrivateRoom,
+  privateRooms,
   activeGames,
   socketRoom,
 };

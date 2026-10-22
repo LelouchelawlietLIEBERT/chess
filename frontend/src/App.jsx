@@ -2,8 +2,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Chess } from "chess.js";
 import { Chessboard } from "react-chessboard";
 import { io } from "socket.io-client";
+import { jwtDecode } from "jwt-decode";
 
-const SOCKET_URL = process.env.REACT_APP_SOCKET_URL || "http://localhost:3001";
+const SOCKET_URL = process.env.REACT_APP_SOCKET_URL || "http://localhost:8080";
+const API_URL = process.env.REACT_APP_API_URL || SOCKET_URL;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function fmt(ms) {
@@ -15,6 +17,28 @@ function kingSquare(chess, color) {
     for (const sq of row)
       if (sq?.type === "k" && sq.color === color) return sq.square;
   return null;
+}
+
+// ─── Auth / room URL helpers ─────────────────────────────────────────────────
+function loadStoredAuth() {
+  const stored = localStorage.getItem("bb_token");
+  if (!stored) return { token: null, user: null };
+  try {
+    const decoded = jwtDecode(stored);
+    if (decoded.exp && decoded.exp * 1000 < Date.now()) throw new Error("expired");
+    return {
+      token: stored,
+      user: { username: decoded.username, isGuest: !!decoded.isGuest },
+    };
+  } catch {
+    localStorage.removeItem("bb_token");
+    return { token: null, user: null };
+  }
+}
+
+function readRoomFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return (params.get("room") || "").trim().toUpperCase();
 }
 
 // ─── Clock ────────────────────────────────────────────────────────────────────
@@ -150,7 +174,26 @@ export default function App() {
   const chessRef      = useRef(new Chess());
   const rollbackFenRef = useRef(null);   // snapshot before optimistic update, for rejection rollback
 
-  const [phase,        setPhase]        = useState("lobby");
+  // ─── Auth / private room state ───────────────────────────────────────────────
+  const initialAuthRef = useRef(null);
+  if (initialAuthRef.current === null) initialAuthRef.current = loadStoredAuth();
+  const initialRoomRef = useRef(null);
+  if (initialRoomRef.current === null) initialRoomRef.current = readRoomFromUrl();
+
+  const [token,     setToken]     = useState(initialAuthRef.current.token);
+  const [authUser,  setAuthUser]  = useState(initialAuthRef.current.user);
+  const [authTab,   setAuthTab]   = useState("login");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authConfirm,  setAuthConfirm]  = useState("");
+  const [authError,    setAuthError]    = useState("");
+  const [authBusy,     setAuthBusy]     = useState(false);
+
+  const [phase,        setPhase]        = useState(initialRoomRef.current ? "joinRoom" : "lobby");
+  const [joinCode,     setJoinCode]     = useState(initialRoomRef.current);
+  const [privateRoom,  setPrivateRoom]  = useState(null);
+  const [roomError,    setRoomError]    = useState("");
+  const [copied,       setCopied]       = useState(false);
   const [selectedTC,   setSelectedTC]   = useState(5);
   const [roomId,       setRoomId]       = useState(null);
   const [myColor,      setMyColor]      = useState("w");
@@ -231,12 +274,45 @@ export default function App() {
 
   // ─── Socket ─────────────────────────────────────────────────────────────────
   useEffect(() => {
-    const socket = io(SOCKET_URL, { transports: ["websocket"] });
+    if (!token) return;
+
+    const socket = io(SOCKET_URL, {
+      transports: ["websocket"],
+      auth: { token },
+    });
     socketRef.current = socket;
 
     socket.on("assignedName", ({ name }) => setMyName(name));
     socket.on("waitingForOpponent", () => setPhase("waiting"));
     socket.on("queueCancelled",     () => setPhase("lobby"));
+
+    socket.on("privateRoomCreated", (data) => {
+      setPrivateRoom(data);
+      setRoomError("");
+      setCopied(false);
+      setPhase("privateWaiting");
+    });
+
+    socket.on("privateRoomCancelled", () => {
+      setPrivateRoom(null);
+      setCopied(false);
+      setPhase("lobby");
+    });
+
+    socket.on("roomError", ({ message }) => {
+      setRoomError(message);
+      setPhase(prev => (prev === "joiningRoom" ? "joinRoom" : prev));
+    });
+
+    socket.on("connect_error", (err) => {
+      if (/token/i.test(err?.message || "")) {
+        localStorage.removeItem("bb_token");
+        setToken(null);
+        setAuthUser(null);
+        setMyName("");
+        setAuthError("Session expired. Please log in again.");
+      }
+    });
 
     socket.on("gameStart", (data) => {
       chessRef.current = new Chess();
@@ -257,6 +333,12 @@ export default function App() {
       setPremoveSq(null);
       setChatMessages([]);
       setStatus(`${data.timeControl}m · ${data.color === "w" ? "You play White" : "You play Black"}`);
+      // Consume the private room invite so a refresh doesn't re-open the join screen.
+      setPrivateRoom(null);
+      setJoinCode("");
+      setRoomError("");
+      setCopied(false);
+      if (window.location.search) window.history.replaceState({}, "", window.location.pathname);
       setPhase("game");
     });
 
@@ -284,7 +366,9 @@ export default function App() {
       // We use a ref trick: read premove from a ref so the closure is fresh
     });
 
-    socket.on("clockUpdate", ({ clocks }) => syncClocks(clocks, clockSyncRef.current.turn, true));
+    socket.on("clockUpdate", ({ clocks, turn }) =>
+      syncClocks(clocks, turn || clockSyncRef.current.turn, true)
+    );
 
     socket.on("moveRejected", ({ reason }) => {
       setStatus(`⚠ ${reason}`);
@@ -320,7 +404,7 @@ export default function App() {
     socket.on("drawDeclined", () => setStatus("Draw declined."));
 
     return () => socket.disconnect();
-  }, [syncClocks]);
+  }, [token, syncClocks]);
 
   // ─── Premove fire effect ─────────────────────────────────────────────────────
   // When turn changes to myColor and there's a queued premove, fire it
@@ -524,6 +608,131 @@ export default function App() {
     setDisplayClocks({ w: 300000, b: 300000 });
   };
 
+  // ─── Auth actions ────────────────────────────────────────────────────────────
+  const submitAuth = async (e) => {
+    e.preventDefault();
+    if (authBusy) return;
+    setAuthError("");
+
+    const username = authUsername.trim();
+    if (authTab !== "guest") {
+      if (!username || !authPassword) {
+        setAuthError("Enter a username and password");
+        return;
+      }
+      if (authTab === "register" && username.length < 3) {
+        setAuthError("Username must be at least 3 characters");
+        return;
+      }
+      if (authTab === "register" && authPassword !== authConfirm) {
+        setAuthError("Passwords do not match");
+        return;
+      }
+    }
+
+    setAuthBusy(true);
+    try {
+      const endpoint = authTab === "guest" ? "guest" : authTab;
+      const res = await fetch(`${API_URL}/auth/${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: authTab === "guest"
+          ? undefined
+          : JSON.stringify({ username, password: authPassword }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.token) throw new Error(data.error || "Authentication failed");
+
+      // Always decode identity from the JWT — never trust a separate user payload.
+      const decoded = jwtDecode(data.token);
+      localStorage.setItem("bb_token", data.token);
+      setToken(data.token);
+      setAuthUser({ username: decoded.username, isGuest: !!decoded.isGuest });
+      setMyName(decoded.username || "");
+      setAuthUsername("");
+      setAuthPassword("");
+      setAuthConfirm("");
+    } catch (err) {
+      setAuthError(err.message || "Authentication failed");
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const logout = () => {
+    socketRef.current?.disconnect();
+    localStorage.removeItem("bb_token");
+    setToken(null);
+    setAuthUser(null);
+    setMyName("");
+    setPhase("lobby");
+    setJoinCode("");
+    setPrivateRoom(null);
+    setRoomError("");
+    setCopied(false);
+    setGameOver(null);
+    setChatMessages([]);
+    setStatus("");
+    if (window.location.search) window.history.replaceState({}, "", window.location.pathname);
+  };
+
+  // ─── Private room actions ────────────────────────────────────────────────────
+  const shareUrl = privateRoom
+    ? `${window.location.origin}${window.location.pathname}?room=${privateRoom.code}`
+    : "";
+
+  const createPrivate = () => {
+    setRoomError("");
+    socketRef.current?.emit("createPrivateRoom", { timeControl: selectedTC });
+  };
+
+  const joinPrivate = () => {
+    const code = joinCode.trim().toUpperCase();
+    if (!code) {
+      setRoomError("Enter a room code");
+      return;
+    }
+    setJoinCode(code);
+    setRoomError("");
+    setPhase("joiningRoom");
+    socketRef.current?.emit("joinPrivateRoom", { code });
+  };
+
+  const cancelPrivate = () => {
+    if (privateRoom) {
+      socketRef.current?.emit("cancelPrivateRoom", { code: privateRoom.code });
+    }
+    setPrivateRoom(null);
+    setCopied(false);
+    setPhase("lobby");
+  };
+
+  const leaveJoinScreen = () => {
+    setJoinCode("");
+    setRoomError("");
+    setPhase("lobby");
+    if (window.location.search) window.history.replaceState({}, "", window.location.pathname);
+  };
+
+  const copyShareLink = async () => {
+    if (!shareUrl) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(shareUrl);
+    } catch {
+      const el = document.createElement("textarea");
+      el.value = shareUrl;
+      el.style.position = "fixed";
+      el.style.opacity = "0";
+      document.body.appendChild(el);
+      el.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(el);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   // ─── Square styles ───────────────────────────────────────────────────────────
   const chess   = chessRef.current;
   const oppColor= myColor === "w" ? "b" : "w";
@@ -600,6 +809,122 @@ export default function App() {
           <div style={{ width: 60, height: 1, background: "linear-gradient(90deg,#3a3228,transparent)" }} />
         </div>
 
+        {token && (
+          <div style={{ display:"flex", alignItems:"center", gap:10, marginTop:-16, marginBottom:20,
+            fontSize:12, color:"#6b5f4b" }}>
+            <span style={{ fontStyle:"italic" }}>{authUser?.username || myName}</span>
+            {authUser?.isGuest && (
+              <span style={{ fontSize:9, letterSpacing:2, textTransform:"uppercase", color:"#4a4035" }}>guest</span>
+            )}
+            <button onClick={logout} style={{ background:"transparent", border:"none", padding:0,
+              color:"#4a4035", cursor:"pointer", fontFamily:"inherit", fontSize:11,
+              letterSpacing:1, textDecoration:"underline" }}>logout</button>
+          </div>
+        )}
+
+        {!token ? (
+          /* ── AUTH ─────────────────────────────────────────────────────────── */
+          <div style={{ width:"100%", maxWidth:380, background:"#1a1714",
+            border:"1px solid #2e2820", borderRadius:12, padding:"28px 24px",
+            display:"flex", flexDirection:"column", gap:18,
+            boxShadow:"0 20px 60px rgba(0,0,0,0.5)" }}>
+
+            <div style={{ textAlign:"center" }}>
+              <h1 style={{ fontSize:34, fontWeight:400, color:"#e8e0d0", lineHeight:1.1 }}>BlitzBoard</h1>
+              <p style={{ fontSize:11, color:"#4a4035", letterSpacing:3, textTransform:"uppercase", marginTop:6 }}>
+                Enter the arena
+              </p>
+            </div>
+
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:6 }}>
+              {[
+                { id:"login", label:"Login" },
+                { id:"register", label:"Register" },
+                { id:"guest", label:"Guest" },
+              ].map(t => (
+                <button key={t.id} type="button"
+                  onClick={() => { setAuthTab(t.id); setAuthError(""); }}
+                  style={{
+                    padding:"9px 4px", borderRadius:6, cursor:"pointer",
+                    fontFamily:"inherit", fontSize:11, letterSpacing:2,
+                    textTransform:"uppercase", transition:"all 0.15s",
+                    background: authTab===t.id ? "rgba(200,169,110,0.12)" : "transparent",
+                    border: `1px solid ${authTab===t.id ? "#c8a96e" : "#2e2820"}`,
+                    color: authTab===t.id ? "#c8a96e" : "#6b5f4b",
+                  }}>{t.label}</button>
+              ))}
+            </div>
+
+            <form onSubmit={submitAuth} style={{ display:"flex", flexDirection:"column", gap:12 }}>
+              {authTab !== "guest" && (
+                <>
+                  <input
+                    value={authUsername}
+                    onChange={e => setAuthUsername(e.target.value)}
+                    placeholder="Username"
+                    autoComplete="username"
+                    maxLength={20}
+                    style={authInputStyle}
+                    onFocus={e => e.currentTarget.style.borderColor = "#c8a96e"}
+                    onBlur={e => e.currentTarget.style.borderColor = "#2e2820"}
+                  />
+                  <input
+                    type="password"
+                    value={authPassword}
+                    onChange={e => setAuthPassword(e.target.value)}
+                    placeholder="Password"
+                    autoComplete={authTab === "register" ? "new-password" : "current-password"}
+                    style={authInputStyle}
+                    onFocus={e => e.currentTarget.style.borderColor = "#c8a96e"}
+                    onBlur={e => e.currentTarget.style.borderColor = "#2e2820"}
+                  />
+                </>
+              )}
+
+              {authTab === "register" && (
+                <input
+                  type="password"
+                  value={authConfirm}
+                  onChange={e => setAuthConfirm(e.target.value)}
+                  placeholder="Confirm password"
+                  autoComplete="new-password"
+                  style={authInputStyle}
+                  onFocus={e => e.currentTarget.style.borderColor = "#c8a96e"}
+                  onBlur={e => e.currentTarget.style.borderColor = "#2e2820"}
+                />
+              )}
+
+              {authTab === "guest" && (
+                <p style={{ fontSize:13, color:"#6b5f4b", textAlign:"center", lineHeight:1.5 }}>
+                  Jump straight in with a temporary name. No password needed.
+                </p>
+              )}
+
+              {authError && (
+                <p style={{ fontSize:12, color:"#e05252", textAlign:"center" }}>{authError}</p>
+              )}
+
+              <button type="submit" disabled={authBusy} style={{
+                width:"100%", padding:14, marginTop:2,
+                background:"linear-gradient(135deg,#c8a96e 0%,#a07840 100%)",
+                border:"none", borderRadius:6, color:"#0d0d0f",
+                fontSize:12, letterSpacing:3, textTransform:"uppercase",
+                fontFamily:"inherit", cursor: authBusy ? "wait" : "pointer",
+                opacity: authBusy ? 0.7 : 1,
+              }}>
+                {authBusy
+                  ? "Please wait…"
+                  : authTab === "guest"
+                  ? "Play as Guest"
+                  : authTab === "register"
+                  ? "Create Account"
+                  : "Login"}
+              </button>
+            </form>
+          </div>
+        ) : (
+          <>
+
         {/* ── LOBBY ─────────────────────────────────────────────────────────── */}
         {phase === "lobby" && (
           <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:24, maxWidth:360, width:"100%" }}>
@@ -633,6 +958,24 @@ export default function App() {
               fontSize:13, letterSpacing:3, textTransform:"uppercase",
               fontFamily:"inherit", cursor:"pointer",
             }}>Find Opponent</button>
+
+            <div style={{ width:"100%", display:"flex", flexDirection:"column", gap:10 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, color:"#3a3228",
+                fontSize:10, letterSpacing:3, textTransform:"uppercase" }}>
+                <div style={{ flex:1, height:1, background:"#2e2820" }} />
+                Play with a Friend
+                <div style={{ flex:1, height:1, background:"#2e2820" }} />
+              </div>
+              <button onClick={createPrivate} style={{
+                width:"100%", padding:13, background:"transparent",
+                border:"1px solid #3a3228", borderRadius:6, color:"#b8a98a",
+                fontSize:12, letterSpacing:2, textTransform:"uppercase",
+                fontFamily:"inherit", cursor:"pointer",
+              }}>Create Private Room</button>
+              {roomError && (
+                <p style={{ fontSize:12, color:"#e05252", textAlign:"center" }}>{roomError}</p>
+              )}
+            </div>
           </div>
         )}
 
@@ -647,6 +990,95 @@ export default function App() {
               cursor:"pointer", fontFamily:"inherit", fontSize:13, letterSpacing:2 }}>Cancel</button>
           </div>
         )}
+
+        {/* ── PRIVATE ROOM WAITING ──────────────────────────────────────────── */}
+        {phase === "privateWaiting" && (
+          <div style={{ width:"100%", maxWidth:420, background:"#1a1714",
+            border:"1px solid #2e2820", borderRadius:12, padding:"28px 24px",
+            display:"flex", flexDirection:"column", alignItems:"center", gap:16,
+            textAlign:"center", boxShadow:"0 20px 60px rgba(0,0,0,0.5)" }}>
+            <div style={{ width:36, height:36, border:"2px solid #2e2820",
+              borderTop:"2px solid #c8a96e", borderRadius:"50%", animation:"spin 1s linear infinite" }} />
+            <h2 style={{ fontSize:30, fontWeight:400, color:"#e8e0d0" }}>Room Ready</h2>
+            <p style={{ fontSize:13, color:"#6b5f4b" }}>Waiting for opponent…</p>
+
+            {privateRoom ? (
+              <>
+                <div style={{ fontFamily:"'Courier New', monospace", fontSize:28, letterSpacing:8,
+                  color:"#c8a96e", padding:"8px 18px", background:"rgba(200,169,110,0.08)",
+                  border:"1px solid #3a3228", borderRadius:8 }}>{privateRoom.code}</div>
+
+                <div style={{ width:"100%", background:"#0f0e0c", border:"1px solid #1e1a16",
+                  borderRadius:6, padding:"10px 12px", fontSize:12, color:"#8a7a62",
+                  wordBreak:"break-all", lineHeight:1.5 }}>{shareUrl}</div>
+
+                <div style={{ display:"flex", gap:8, width:"100%" }}>
+                  <button onClick={copyShareLink} style={{
+                    flex:1, padding:12,
+                    background:"linear-gradient(135deg,#c8a96e 0%,#a07840 100%)",
+                    border:"none", borderRadius:6, color:"#0d0d0f",
+                    fontSize:11, letterSpacing:2, textTransform:"uppercase",
+                    fontFamily:"inherit", cursor:"pointer",
+                  }}>{copied ? "Copied!" : "Copy Link"}</button>
+                  <button onClick={cancelPrivate} style={gBtn("danger")}>Cancel</button>
+                </div>
+
+                <p style={{ fontSize:10, letterSpacing:2, textTransform:"uppercase", color:"#4a4035" }}>
+                  {privateRoom.timeControl} min game · share the link to invite
+                </p>
+              </>
+            ) : (
+              <p style={{ fontSize:13, color:"#4a4035" }}>Creating room…</p>
+            )}
+          </div>
+        )}
+
+        {/* ── JOIN PRIVATE ROOM (from ?room=CODE) ───────────────────────────── */}
+        {(phase === "joinRoom" || phase === "joiningRoom") && (
+          <div style={{ width:"100%", maxWidth:380, background:"#1a1714",
+            border:"1px solid #2e2820", borderRadius:12, padding:"28px 24px",
+            display:"flex", flexDirection:"column", alignItems:"center", gap:16,
+            textAlign:"center", boxShadow:"0 20px 60px rgba(0,0,0,0.5)" }}>
+            <h2 style={{ fontSize:30, fontWeight:400, color:"#e8e0d0" }}>Private Game</h2>
+            <p style={{ fontSize:13, color:"#6b5f4b" }}>You've been invited to a friend's room.</p>
+
+            <input
+              value={joinCode}
+              onChange={e => setJoinCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ""))}
+              placeholder="ROOM CODE"
+              maxLength={6}
+              style={{ ...authInputStyle, width:"100%", textAlign:"center",
+                fontFamily:"'Courier New', monospace", fontSize:22, letterSpacing:6,
+                color:"#c8a96e", padding:"12px" }}
+              onFocus={e => e.currentTarget.style.borderColor = "#c8a96e"}
+              onBlur={e => e.currentTarget.style.borderColor = "#2e2820"}
+            />
+
+            <p style={{ fontSize:10, letterSpacing:2, textTransform:"uppercase", color:"#4a4035" }}>
+              {phase === "joiningRoom" ? "Joining room…" : "Time control is set by the host"}
+            </p>
+
+            {roomError && (
+              <p style={{ fontSize:12, color:"#e05252" }}>{roomError}</p>
+            )}
+
+            <button onClick={joinPrivate} disabled={phase === "joiningRoom"} style={{
+              width:"100%", padding:14,
+              background:"linear-gradient(135deg,#c8a96e 0%,#a07840 100%)",
+              border:"none", borderRadius:6, color:"#0d0d0f",
+              fontSize:12, letterSpacing:3, textTransform:"uppercase",
+              fontFamily:"inherit", cursor: phase === "joiningRoom" ? "wait" : "pointer",
+              opacity: phase === "joiningRoom" ? 0.7 : 1,
+            }}>Join Game</button>
+
+            <button onClick={leaveJoinScreen} style={{
+              background:"transparent", border:"none", color:"#4a4035",
+              fontSize:11, letterSpacing:2, textTransform:"uppercase",
+              cursor:"pointer", fontFamily:"inherit",
+            }}>Back to lobby</button>
+          </div>
+        )}
+
 
         {/* ── GAME ──────────────────────────────────────────────────────────── */}
         {(phase === "game" || phase === "ended") && (
@@ -805,10 +1237,19 @@ export default function App() {
             </div>
           </div>
         )}
+          </>
+        )}
       </div>
     </>
   );
 }
+
+const authInputStyle = {
+  width:"100%", background:"#131210", border:"1px solid #2e2820",
+  borderRadius:6, padding:"11px 13px", color:"#e8e0d0",
+  fontSize:14, fontFamily:"inherit", outline:"none",
+  transition:"border-color 0.15s",
+};
 
 function gBtn(variant) {
   return {
