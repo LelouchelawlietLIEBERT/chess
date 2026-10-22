@@ -213,7 +213,7 @@ io.on("connection", (socket) => {
 });
 
 // ─── Start ───────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, "0.0.0.0",() => {
   console.log(`♟  Chess server running on http://localhost:${PORT}`);
 });
