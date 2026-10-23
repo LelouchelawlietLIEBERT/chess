@@ -6,8 +6,10 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
+const { Chess } = require("chess.js");
 
 const authRouter = require("./routes/auth");
+const GameModel = require("./models/Game");
 const {
   joinQueue,
   leaveQueue,
@@ -18,6 +20,7 @@ const {
   createPrivateRoom,
   joinPrivateRoom,
   cancelPrivateRoom,
+  saveGame,
   activeGames,
 } = require("./gameLogic");
 
@@ -56,6 +59,94 @@ io.use((socket, next) => {
     next();
   } catch {
     next(new Error("Invalid token"));
+  }
+});
+
+// ─── REST auth middleware ────────────────────────────────────────────────────
+function requireAuth(req, res, next) {
+  const token = req.headers.authorization?.split(" ")[1];
+  if (!token) return res.status(401).json({ error: "No token" });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.userId;
+    req.username = decoded.username;
+    next();
+  } catch {
+    res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// ─── Game history ────────────────────────────────────────────────────────────
+app.get("/games/history", requireAuth, async (req, res) => {
+  try {
+    const games = await GameModel.find({
+      $or: [{ "white.userId": req.userId }, { "black.userId": req.userId }],
+    })
+      .sort({ playedAt: -1 })
+      .limit(10)
+      .lean();
+
+    res.json(games);
+  } catch (err) {
+    console.error("History error:", err);
+    res.status(500).json({ error: "Could not load game history" });
+  }
+});
+
+// Save a client-side game (vs Computer) to the player's history.
+app.post("/games", requireAuth, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const rawMoves = Array.isArray(body.moves) ? body.moves.slice(0, 500) : [];
+    const result = ["1-0", "0-1", "1/2-1/2"].includes(body.result)
+      ? body.result
+      : "1/2-1/2";
+    const playerColor = body.playerColor === "b" ? "b" : "w";
+    const opponentName = String(body.opponentName || "Stockfish").slice(0, 40);
+    const termination = String(body.termination || "unknown").slice(0, 60);
+    const timeControl = String(body.timeControl || "unlimited").slice(0, 12);
+
+    // Replay the moves so the stored PGN/FEN cannot be spoofed independently.
+    const chess = new Chess();
+    for (const san of rawMoves) {
+      try {
+        if (!chess.move(String(san))) throw new Error("Illegal move");
+      } catch {
+        return res.status(400).json({ error: "Invalid move list" });
+      }
+    }
+
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, ".");
+    const white = playerColor === "w"
+      ? { userId: req.userId, username: req.username }
+      : { username: opponentName };
+    const black = playerColor === "b"
+      ? { userId: req.userId, username: req.username }
+      : { username: opponentName };
+
+    chess.header(
+      "White", white.username,
+      "Black", black.username,
+      "Result", result,
+      "TimeControl", timeControl === "unlimited" ? "-" : String(Number(timeControl) * 60),
+      "Date", today
+    );
+
+    const game = await GameModel.create({
+      white,
+      black,
+      result,
+      termination,
+      timeControl,
+      moves: chess.history(),
+      pgn: chess.pgn(),
+      finalFen: chess.fen(),
+    });
+
+    return res.status(201).json(game);
+  } catch (err) {
+    console.error("Save game error:", err);
+    return res.status(500).json({ error: "Could not save game" });
   }
 });
 
@@ -116,7 +207,7 @@ io.on("connection", (socket) => {
   console.log(`[+] Connected: ${socket.id} (${socket.data.username})`);
 
   // ── Authenticated username ─────────────────────────────────────────────────
-  registerPlayer(socket.id, socket.data.username);
+  registerPlayer(socket.id, socket.data.username, socket.data.userId);
   socket.emit("assignedName", { name: socket.data.username });
 
   // ── Matchmaking ────────────────────────────────────────────────────────────
@@ -219,6 +310,8 @@ io.on("connection", (socket) => {
     const winner = loserColor === "w" ? "b" : "w";
     const winnerName = winner === "w" ? game.whiteName : game.blackName;
 
+    saveGame(game, winner, "resignation");
+
     io.to(roomId).emit("gameOver", {
       reason: "resignation",
       winner,
@@ -240,6 +333,8 @@ io.on("connection", (socket) => {
 
     game.status = "ended";
     clearInterval(game.timerRef);
+
+    saveGame(game, null, "draw by agreement");
 
     io.to(roomId).emit("gameOver", {
       reason: "draw by agreement",

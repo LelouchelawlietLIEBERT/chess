@@ -1,4 +1,5 @@
 const { Chess } = require("chess.js");
+const GameModel = require("./models/Game");
 
 // ─── In-memory state ─────────────────────────────────────────────────────────
 // queues[timeControl] = [socketId, ...]
@@ -24,6 +25,9 @@ const privateRooms = {};
 // playerNames[socketId] = string (authenticated username)
 const playerNames = {};
 
+// playerUserIds[socketId] = authenticated MongoDB user id
+const playerUserIds = {};
+
 // socketRoom[socketId] = roomId  (for quick lookup on disconnect)
 const socketRoom = {};
 
@@ -32,8 +36,9 @@ function getRoomId() {
   return `room_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function registerPlayer(socketId, username) {
+function registerPlayer(socketId, username, userId) {
   playerNames[socketId] = username;
+  playerUserIds[socketId] = userId;
   return username;
 }
 
@@ -52,11 +57,14 @@ function createGame(white, black, timeControl) {
     black,
     whiteName: getPlayerName(white),
     blackName: getPlayerName(black),
+    whiteUserId: playerUserIds[white] || null,
+    blackUserId: playerUserIds[black] || null,
     timeControl: Number(timeControl),
     clocks: { w: tcMs, b: tcMs },
     turnStart: new Date(),
     timerRef: null,
     status: "active",
+    saved: false,
   };
 
   activeGames[roomId] = game;
@@ -169,6 +177,43 @@ setInterval(() => {
   }
 }, 60 * 1000).unref();
 
+// ─── Game persistence ────────────────────────────────────────────────────────
+function resultFromWinner(winner) {
+  if (winner === "w") return "1-0";
+  if (winner === "b") return "0-1";
+  return "1/2-1/2";
+}
+
+async function saveGame(game, winner, termination) {
+  if (!game || game.saved) return;
+  game.saved = true;
+
+  const result = resultFromWinner(winner);
+  try {
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, ".");
+    game.chess.header(
+      "White", game.whiteName,
+      "Black", game.blackName,
+      "Result", result,
+      "TimeControl", `${game.timeControl * 60}`,
+      "Date", today
+    );
+
+    await GameModel.create({
+      white: { userId: game.whiteUserId || undefined, username: game.whiteName },
+      black: { userId: game.blackUserId || undefined, username: game.blackName },
+      result,
+      termination,
+      timeControl: String(game.timeControl),
+      moves: game.chess.history(),
+      pgn: game.chess.pgn(),
+      finalFen: game.chess.fen(),
+    });
+  } catch (err) {
+    console.error("Failed to save game:", err.message);
+  }
+}
+
 // ─── Clock management ────────────────────────────────────────────────────────
 function startClock(roomId, io) {
   const game = activeGames[roomId];
@@ -193,11 +238,11 @@ function startClock(roomId, io) {
       g.status = "ended";
       clearInterval(g.timerRef);
 
-      const loser = turn === "w" ? g.white : g.black;
-      const winner = turn === "w" ? g.black : g.white;
+      const winnerColor = turn === "w" ? "b" : "w";
+      saveGame(g, winnerColor, "timeout");
       io.to(roomId).emit("gameOver", {
         reason: "timeout",
-        winner: turn === "w" ? "b" : "w",
+        winner: winnerColor,
         winnerName: turn === "w" ? g.blackName : g.whiteName,
         clocks: g.clocks,
       });
@@ -295,6 +340,7 @@ function applyMove(roomId, socketId, movePayload) {
     }
 
     result.gameOver = { reason, winner, winnerName };
+    saveGame(game, winner, reason);
   }
 
   return result;
@@ -304,6 +350,7 @@ function applyMove(roomId, socketId, movePayload) {
 function handleDisconnect(socketId, io) {
   leaveQueue(socketId);
   delete playerNames[socketId];
+  delete playerUserIds[socketId];
 
   for (const [code, room] of Object.entries(privateRooms)) {
     if (room.socketId === socketId) delete privateRooms[code];
@@ -323,6 +370,8 @@ function handleDisconnect(socketId, io) {
 
   const winner = socketId === game.white ? "b" : "w";
   const winnerName = winner === "w" ? game.whiteName : game.blackName;
+
+  saveGame(game, winner, "opponent disconnected");
 
   io.to(roomId).emit("gameOver", {
     reason: "opponent disconnected",
@@ -349,6 +398,7 @@ module.exports = {
   createPrivateRoom,
   joinPrivateRoom,
   cancelPrivateRoom,
+  saveGame,
   privateRooms,
   activeGames,
   socketRoom,
